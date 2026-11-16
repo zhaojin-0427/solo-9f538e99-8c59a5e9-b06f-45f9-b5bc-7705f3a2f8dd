@@ -19,6 +19,7 @@ never overwritten or deleted, so every published version stays downloadable.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -61,6 +62,31 @@ CREATE INDEX IF NOT EXISTS versions_day_idx ON versions(day);
 CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analyses (
+    report_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    longitude          REAL    NOT NULL,
+    latitude           REAL    NOT NULL,
+    start_day          TEXT    NOT NULL,
+    end_day            TEXT    NOT NULL,
+    threshold_mm       REAL    NOT NULL,
+    params_key         TEXT    NOT NULL,
+    requested_days     TEXT    NOT NULL,
+    selected_versions  TEXT    NOT NULL,
+    snapshot_version   INTEGER NOT NULL,
+    snapshot_at        TEXT    NOT NULL,
+    evidence           TEXT    NOT NULL,
+    events             TEXT    NOT NULL,
+    created_at         TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS analyses_params_idx ON analyses(params_key, report_id);
+
+CREATE TABLE IF NOT EXISTS analysis_current (
+    params_key        TEXT    PRIMARY KEY,
+    report_id         INTEGER NOT NULL,
+    snapshot_version  INTEGER NOT NULL,
+    snapshot_at       TEXT    NOT NULL
 );
 """
 
@@ -449,3 +475,403 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Station interpretation reports
+# ---------------------------------------------------------------------------
+
+# A report always uses one fixed set of version numbers selected in a single
+# read snapshot.  ``snapshot_version`` is the largest version that existed
+# when the selection was made; because version numbers only grow, comparing
+# these values totally orders competing reports for the same parameters.
+
+
+class ReportSelectionError(Exception):
+    """The version set for a report could not be selected."""
+
+
+def analysis_params_key(
+    *,
+    longitude: float,
+    latitude: float,
+    start_day: str,
+    end_day: str,
+    threshold_mm: float,
+) -> str:
+    """Canonical key for "the same parameters" of an interpretation report."""
+
+    def normalise(value: float) -> float:
+        # Collapse -0.0 to 0.0 and make 1 and 1.0 compare identically.
+        return float(value) + 0.0
+
+    return json.dumps(
+        [
+            normalise(longitude),
+            normalise(latitude),
+            start_day,
+            end_day,
+            normalise(threshold_mm),
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _latest_versions(
+    conn: sqlite3.Connection,
+    days: list[str],
+    cache: dict[str, int | None] | None = None,
+) -> dict[str, int | None]:
+    latest: dict[str, int | None] = {}
+    for day in days:
+        if cache is not None and day in cache:
+            latest[day] = cache[day]
+            continue
+        row = conn.execute(
+            "SELECT MAX(version) AS version FROM versions WHERE day = ?", (day,)
+        ).fetchone()
+        value = int(row["version"]) if row["version"] is not None else None
+        latest[day] = value
+        if cache is not None:
+            cache[day] = value
+    return latest
+
+
+def select_versions(
+    settings: Settings, days: list[str]
+) -> tuple[int, dict[str, int | None], str]:
+    """Pick the newest version per day from one consistent database snapshot.
+
+    The deferred read transaction holds one WAL snapshot for all queries, so a
+    publication committing halfway through can never contribute a version to
+    only part of the selection.  ``snapshot_version`` is the highest version
+    number in that snapshot.
+    """
+
+    conn = connect(settings)
+    try:
+        try:
+            conn.execute("BEGIN")
+        except sqlite3.OperationalError as exc:
+            raise ReportSelectionError("could not open a selection snapshot") from exc
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS version FROM versions"
+            ).fetchone()
+            snapshot_version = int(row["version"])
+            selected = _latest_versions(conn, days)
+            snapshot_at = iso_utc(datetime.now(timezone.utc))
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback(conn)
+            raise
+        return snapshot_version, selected, snapshot_at
+    except sqlite3.Error as exc:
+        raise ReportSelectionError("could not select published versions") from exc
+    finally:
+        conn.close()
+
+
+def _report_row_to_payload(
+    row: sqlite3.Row,
+    *,
+    current_report_id: int | None,
+    latest: dict[str, int | None],
+) -> dict[str, Any]:
+    days: list[str] = json.loads(row["requested_days"])
+    selected: dict[str, int | None] = json.loads(row["selected_versions"])
+    events = json.loads(row["events"])
+    stale_days = [day for day in days if selected.get(day) != latest.get(day)]
+    return {
+        "report_id": int(row["report_id"]),
+        "parameters": {
+            "longitude": float(row["longitude"]),
+            "latitude": float(row["latitude"]),
+            "start_day": row["start_day"],
+            "end_day": row["end_day"],
+            "threshold_mm": float(row["threshold_mm"]),
+        },
+        "basis": {
+            "snapshot_version": int(row["snapshot_version"]),
+            "selected_at": row["snapshot_at"],
+            "days": [
+                {"day": day, "version": selected.get(day)} for day in days
+            ],
+            "versions": {day: selected.get(day) for day in days},
+        },
+        "events": events,
+        "event_count": len(events),
+        "days": json.loads(row["evidence"]),
+        "created_at": row["created_at"],
+        "is_current": current_report_id is not None and int(row["report_id"]) == current_report_id,
+        "stale": bool(stale_days),
+        "stale_days": stale_days,
+    }
+
+
+def _report_summary(
+    row: sqlite3.Row,
+    *,
+    current_report_id: int | None,
+    latest: dict[str, int | None],
+) -> dict[str, Any]:
+    payload = _report_row_to_payload(
+        row, current_report_id=current_report_id, latest=latest
+    )
+    return {
+        "report_id": payload["report_id"],
+        "parameters": payload["parameters"],
+        "event_count": payload["event_count"],
+        "event_days": [
+            [event["start_day"], event["end_day"]] for event in payload["events"]
+        ],
+        "snapshot_version": payload["basis"]["snapshot_version"],
+        "selected_at": payload["basis"]["selected_at"],
+        "created_at": payload["created_at"],
+        "is_current": payload["is_current"],
+        "stale": payload["stale"],
+        "stale_days": payload["stale_days"],
+    }
+
+
+def save_report(
+    settings: Settings,
+    *,
+    longitude: float,
+    latitude: float,
+    start_day: str,
+    end_day: str,
+    threshold_mm: float,
+    days: list[str],
+    snapshot_version: int,
+    snapshot_at: str,
+    selected: dict[str, int | None],
+    evidence: list[dict],
+    events: list[dict],
+) -> dict[str, Any]:
+    """Persist one complete report and update the per-parameter conclusion.
+
+    The report is only written after its evidence has been computed, so a
+    failure leaves neither a partial report nor a moved conclusion pointer.
+    A report computed from an older snapshot than the conclusion currently on
+    file is stored and remains queryable, but never becomes the conclusion:
+    a late-finishing computation cannot overwrite a newer one.
+    """
+
+    params_key = analysis_params_key(
+        longitude=longitude,
+        latitude=latitude,
+        start_day=start_day,
+        end_day=end_day,
+        threshold_mm=threshold_mm,
+    )
+    created_at = iso_utc(datetime.now(timezone.utc))
+    conn = connect(settings)
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise PublishBusy() from exc
+            raise
+        try:
+            existing = conn.execute(
+                "SELECT report_id, snapshot_version FROM analysis_current WHERE params_key = ?",
+                (params_key,),
+            ).fetchone()
+            is_current = existing is None or snapshot_version > int(existing["snapshot_version"])
+
+            cursor = conn.execute(
+                """
+                INSERT INTO analyses (
+                    longitude, latitude, start_day, end_day, threshold_mm,
+                    params_key, requested_days, selected_versions,
+                    snapshot_version, snapshot_at, evidence, events, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    longitude,
+                    latitude,
+                    start_day,
+                    end_day,
+                    threshold_mm,
+                    params_key,
+                    json.dumps(days),
+                    json.dumps(selected),
+                    snapshot_version,
+                    snapshot_at,
+                    json.dumps(evidence),
+                    json.dumps(events),
+                    created_at,
+                ),
+            )
+            report_id = int(cursor.lastrowid)
+            if is_current:
+                conn.execute(
+                    """
+                    INSERT INTO analysis_current (
+                        params_key, report_id, snapshot_version, snapshot_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(params_key) DO UPDATE SET
+                        report_id = excluded.report_id,
+                        snapshot_version = excluded.snapshot_version,
+                        snapshot_at = excluded.snapshot_at
+                    """,
+                    (
+                        params_key,
+                        report_id,
+                        snapshot_version,
+                        snapshot_at,
+                    ),
+                )
+            latest = _latest_versions(conn, days)
+            current_row = conn.execute(
+                "SELECT report_id FROM analysis_current WHERE params_key = ?",
+                (params_key,),
+            ).fetchone()
+            current_report_id = (
+                int(current_row["report_id"]) if current_row is not None else None
+            )
+            row = conn.execute(
+                "SELECT * FROM analyses WHERE report_id = ?", (report_id,)
+            ).fetchone()
+            assert row is not None
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback(conn)
+            raise
+        log.info(
+            "saved interpretation report %s for %s..%s (snapshot %s, current=%s)",
+            report_id,
+            start_day,
+            end_day,
+            snapshot_version,
+            is_current,
+        )
+        return _report_row_to_payload(
+            row, current_report_id=current_report_id, latest=latest
+        )
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def _read_snapshot(conn: sqlite3.Connection):
+    """Hold one consistent WAL read snapshot for a group of queries."""
+
+    conn.execute("BEGIN")
+    try:
+        yield
+    except Exception:
+        _rollback(conn)
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
+def get_report(settings: Settings, report_id: int) -> dict[str, Any] | None:
+    conn = connect(settings)
+    try:
+        with _read_snapshot(conn):
+            row = conn.execute(
+                "SELECT * FROM analyses WHERE report_id = ?", (report_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            days: list[str] = json.loads(row["requested_days"])
+            latest = _latest_versions(conn, days)
+            current = conn.execute(
+                "SELECT report_id FROM analysis_current WHERE params_key = ?",
+                (row["params_key"],),
+            ).fetchone()
+            current_report_id = int(current["report_id"]) if current is not None else None
+            return _report_row_to_payload(
+                row, current_report_id=current_report_id, latest=latest
+            )
+    finally:
+        conn.close()
+
+
+def get_current_report(
+    settings: Settings,
+    *,
+    longitude: float,
+    latitude: float,
+    start_day: str,
+    end_day: str,
+    threshold_mm: float,
+) -> dict[str, Any] | None:
+    params_key = analysis_params_key(
+        longitude=longitude,
+        latitude=latitude,
+        start_day=start_day,
+        end_day=end_day,
+        threshold_mm=threshold_mm,
+    )
+    conn = connect(settings)
+    try:
+        with _read_snapshot(conn):
+            pointer = conn.execute(
+                "SELECT report_id FROM analysis_current WHERE params_key = ?", (params_key,)
+            ).fetchone()
+            if pointer is None:
+                return None
+            row = conn.execute(
+                "SELECT * FROM analyses WHERE report_id = ?", (int(pointer["report_id"]),)
+            ).fetchone()
+            if row is None:  # defensive: a pointer without its report is not a conclusion
+                return None
+            days: list[str] = json.loads(row["requested_days"])
+            latest = _latest_versions(conn, days)
+            return _report_row_to_payload(
+                row, current_report_id=int(pointer["report_id"]), latest=latest
+            )
+    finally:
+        conn.close()
+
+
+def list_reports(
+    settings: Settings,
+    *,
+    params_key: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    conn = connect(settings)
+    try:
+        with _read_snapshot(conn):
+            if params_key is None:
+                total = conn.execute("SELECT COUNT(*) AS n FROM analyses").fetchone()["n"]
+                rows = conn.execute(
+                    "SELECT * FROM analyses ORDER BY report_id DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+            else:
+                total = conn.execute(
+                    "SELECT COUNT(*) AS n FROM analyses WHERE params_key = ?", (params_key,)
+                ).fetchone()["n"]
+                rows = conn.execute(
+                    "SELECT * FROM analyses WHERE params_key = ? "
+                    "ORDER BY report_id DESC LIMIT ? OFFSET ?",
+                    (params_key, limit, offset),
+                ).fetchall()
+
+            pointers = {
+                row["params_key"]: int(row["report_id"])
+                for row in conn.execute("SELECT params_key, report_id FROM analysis_current")
+            }
+            items: list[dict[str, Any]] = []
+            latest_cache: dict[str, int | None] = {}
+            for row in rows:
+                days: list[str] = json.loads(row["requested_days"])
+                latest = _latest_versions(conn, days, latest_cache)
+                current_report_id = pointers.get(row["params_key"])
+                items.append(
+                    _report_summary(
+                        row, current_report_id=current_report_id, latest=latest
+                    )
+                )
+            return items, int(total)
+    finally:
+        conn.close()
+

@@ -28,6 +28,10 @@ them). Change the host port with `RAINMOSAIC_PUBLISHED_PORT=9000 docker compose 
 | GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version |
 | GET | `/api/v1/mosaics/{version}/download` | GeoTIFF for a fixed version |
 | GET | `/api/v1/download/current` | GeoTIFF for the current version |
+| POST | `/api/v1/analyses` | Interpret consecutive heavy-rain days at a station |
+| GET | `/api/v1/analyses` | List stored reports, newest first |
+| GET | `/api/v1/analyses/current` | Current conclusion for one parameter set |
+| GET | `/api/v1/analyses/{report_id}` | One stored report by id |
 | GET | `/healthz` | Liveness, database and current-version check |
 
 `/docs` supports submitting (multipart form), browsing and downloading.
@@ -100,6 +104,79 @@ Errors use `{"detail": {...}}` with `code` and `message`; raster errors also
 carry `slot` (`a`/`b`) and, where applicable, `field` (`crs`, `resolution`,
 `grid_alignment`, `dimensions`, `block_no`).
 
+## Station interpretation reports
+
+`POST /api/v1/analyses` answers "was there continuous heavy rain at this
+station?" over a bounded window of published daily mosaics.
+
+Request body (JSON):
+
+| Field | Meaning |
+| --- | --- |
+| `longitude`, `latitude` | Station position in WGS 84 (`EPSG:4326`), decimal degrees |
+| `start_day`, `end_day` | Inclusive UTC day range, `YYYY-MM-DD`; at most 14 days |
+| `threshold_mm` | Daily rainfall threshold in millimetres (inclusive) |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/analyses \
+  -H 'content-type: application/json' \
+  -d '{"longitude":120.505,"latitude":30.215,
+       "start_day":"2026-01-01","end_day":"2026-01-07","threshold_mm":50}'
+```
+
+### How a report is computed
+
+1. **One snapshot selects every version.** In a single SQLite WAL read
+   transaction the service records the highest published version number and,
+   for every requested day, the newest published version of that day. That
+   version set is fixed for the whole report; publications that land while the
+   report is being computed cannot add a version to some days only.
+2. **Per-day pixel lookup.** For each day the station's WGS 84 coordinates are
+   transformed with pyproj into the selected version's own CRS (so daily
+   mosaics may legitimately use different CRSs), the containing pixel is found
+   with the raster's affine transform, and that single pixel is read.
+3. **Breaks and events.** A day is *usable* only when a version exists, the
+   station falls inside the raster, and the pixel is not NoData. A missing
+   version, an out-of-bounds station and a NoData pixel each break a continuous
+   run. A run of at least two consecutive usable days at or above
+   `threshold_mm` forms an event.
+
+The `201` response contains `events` (each with `start_day`, `end_day`,
+`length_days`, `total_mm` and `daily` entries carrying the day, value and
+version), the full per-day `days` evidence with the lookup row/column and CRS,
+and `basis` with the selection timestamp and the version chosen for every day.
+
+### Reports, staleness and late results
+
+Every report is stored with the exact version set it used and the pixels it
+read, so it stays reproducible and queryable after newer images are published.
+`stale` is `true` when the newest published version of any requested day is no
+longer the version the report used — for example after a previously missing or
+older date is backfilled; `stale_days` lists those days. The old report keeps
+its original evidence and remains available at `GET /api/v1/analyses/{id}`.
+
+For each distinct parameter set (station, day range, threshold) exactly one
+report is the *current conclusion*, exposed by `GET /api/v1/analyses/current`.
+A report computed from a snapshot older than the one recorded for the
+conclusion is still stored and queryable but is marked `"is_current": false`
+and never replaces the newer conclusion, so a slow computation cannot
+overwrite a faster, newer one.
+
+Reports are written only after every selected pixel has been read: a request
+that fails midway stores nothing and leaves the current conclusion untouched.
+
+```bash
+# All reports for one parameter set (all five filters required together)
+curl -G http://localhost:8000/api/v1/analyses \
+  --data-urlencode longitude=120.505 --data-urlencode latitude=30.215 \
+  --data-urlencode start_day=2026-01-01 --data-urlencode end_day=2026-01-07 \
+  --data-urlencode threshold_mm=50
+```
+
+Publishing and downloading mosaics continues to work while reports are being
+computed and stored; the new tables live in the same SQLite database and the
+same `rainmosaic-data` volume.
+
 ## Design notes
 
 * SQLite runs in WAL mode with `synchronous=FULL`; state lives in
@@ -123,7 +200,12 @@ python -m pytest -q
 The test suite covers the mosaic rules (overlap priority, NoData fallback, tie
 break, gaps, alignment/CRS/size validation), publishing, version pinning,
 conflicts, concurrent submissions, failed generation, downloads during
-publication, restart persistence, listing/pagination and error handling.
+publication, restart persistence, listing/pagination and error handling. For
+interpretation it covers daily newest-version selection, per-CRS pixel lookup,
+inclusive thresholds, run breaks from missing days/NoData/out-of-bounds, the
+14-day bound, snapshot isolation from concurrent publications, staleness after
+a backfill, late older-basis reports not replacing newer conclusions, failure
+without a stored report, and restart persistence.
 
 ## Configuration
 

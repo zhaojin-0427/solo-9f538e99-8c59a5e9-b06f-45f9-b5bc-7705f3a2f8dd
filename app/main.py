@@ -14,9 +14,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, store
+from . import __version__, analysis, store
 from .config import Settings, load_settings
 from .limits import BodyLimitMiddleware
 from .rasters import RasterInputError, load_block, validate_pair
@@ -49,6 +50,58 @@ def parse_day(raw: str) -> str:
             },
         )
     return value
+
+
+class AnalysisRequest(BaseModel):
+    """Parameters for one station interpretation report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    longitude: float = Field(
+        ge=-180.0,
+        le=180.0,
+        allow_inf_nan=False,
+        description="Station longitude in WGS 84 (EPSG:4326), decimal degrees",
+    )
+    latitude: float = Field(
+        ge=-90.0,
+        le=90.0,
+        allow_inf_nan=False,
+        description="Station latitude in WGS 84 (EPSG:4326), decimal degrees",
+    )
+    start_day: str = Field(description="First UTC day of the range, YYYY-MM-DD (inclusive)")
+    end_day: str = Field(description="Last UTC day of the range, YYYY-MM-DD (inclusive)")
+    threshold_mm: float = Field(
+        ge=0.0,
+        allow_inf_nan=False,
+        description="Daily rainfall threshold in millimetres; a day qualifies at or above it",
+    )
+
+
+def validate_analysis_request(body: AnalysisRequest) -> tuple[str, str, list[str]]:
+    start_day = parse_day(body.start_day)
+    end_day = parse_day(body.end_day)
+    if start_day > end_day:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_day_range",
+                "message": "start_day must not be later than end_day",
+            },
+        )
+    days = analysis.date_range(start_day, end_day)
+    if len(days) > analysis.MAX_RANGE_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "day_range_too_long",
+                "message": f"at most {analysis.MAX_RANGE_DAYS} UTC days may be interpreted",
+                "days": len(days),
+                "max_days": analysis.MAX_RANGE_DAYS,
+            },
+        )
+    return start_day, end_day, days
+
 
 
 def parse_captured_at(raw: str, slot: str) -> datetime:
@@ -375,6 +428,226 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ) from exc
 
         return await run_in_threadpool(work)
+
+    @app.post(
+        "/api/v1/analyses",
+        status_code=201,
+        tags=["analyses"],
+        summary="Interpret consecutive heavy-rain days at a station",
+        description=(
+            "Select the newest published version of every requested UTC day and read the "
+            "station pixel from exactly that set of versions. The station is given in WGS 84 "
+            "and transformed into each version's own CRS.\n\n"
+            "A day is usable only when that day has a published version, the station lies "
+            "inside the raster and the pixel is not NoData; a missing day, an out-of-bounds "
+            "station or a NoData pixel all break a continuous run. At least two consecutive "
+            "usable days at or above `threshold_mm` form an event, reported with its start and "
+            "end day, accumulated rainfall and the version used for each day.\n\n"
+            "Selection happens in one database snapshot before any pixel is read, so "
+            "publications that happen while the report is computed cannot mix version sets. "
+            "A report only becomes the current conclusion for its parameters if no newer "
+            "snapshot is already on file; a late computation from an older snapshot is still "
+            "stored and queryable but does not replace the newer conclusion. If any selected "
+            "version cannot be read the request fails without storing a report."
+        ),
+        responses={
+            201: {"description": "Report computed and stored"},
+            422: {"description": "Invalid parameters or day range"},
+            503: {"description": "Report storage is busy; retry shortly"},
+        },
+    )
+    async def create_analysis(request: Request, body: AnalysisRequest) -> dict:
+        current_settings = get_settings(request)
+        start_day, end_day, days = validate_analysis_request(body)
+
+        def work() -> dict[str, Any]:
+            try:
+                # One snapshot decides the whole version set before any pixel
+                # is read; later publications cannot enter this report.
+                snapshot_version, selected, snapshot_at = store.select_versions(
+                    current_settings, days
+                )
+                evidence, events = analysis.compute(
+                    current_settings,
+                    longitude=body.longitude,
+                    latitude=body.latitude,
+                    days=days,
+                    selected_versions={
+                        day: version
+                        for day, version in selected.items()
+                        if version is not None
+                    },
+                    threshold_mm=body.threshold_mm,
+                )
+                return store.save_report(
+                    current_settings,
+                    longitude=body.longitude,
+                    latitude=body.latitude,
+                    start_day=start_day,
+                    end_day=end_day,
+                    threshold_mm=body.threshold_mm,
+                    days=days,
+                    snapshot_version=snapshot_version,
+                    snapshot_at=snapshot_at,
+                    selected=selected,
+                    evidence=evidence,
+                    events=events,
+                )
+            except analysis.AnalysisError as exc:
+                log.exception("interpretation failed")
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "analysis_failed",
+                        "message": (
+                            "a selected version could not be interpreted; no report was stored"
+                        ),
+                    },
+                ) from exc
+            except store.ReportSelectionError as exc:
+                log.exception("version selection failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "analysis_unavailable",
+                        "message": "published versions could not be selected; retry shortly",
+                    },
+                ) from exc
+            except store.PublishBusy as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "analysis_busy",
+                        "message": "another report is being stored; retry shortly",
+                    },
+                ) from exc
+            except Exception as exc:
+                # save_report rolls its transaction back on any failure, so this
+                # path never leaves a partial report or a moved conclusion.
+                log.exception("storing interpretation report failed")
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "analysis_failed",
+                        "message": "the report could not be stored; no report was saved",
+                    },
+                ) from exc
+
+        return await run_in_threadpool(work)
+
+    @app.get(
+        "/api/v1/analyses",
+        tags=["analyses"],
+        summary="List interpretation reports (newest first)",
+        description=(
+            "Older reports stay queryable after newer versions are published. `stale` is true "
+            "when the newest published version of any requested day differs from the version "
+            "the report used, which is what happens after a backfilled day is published."
+        ),
+    )
+    def list_analyses(
+        request: Request,
+        longitude: Annotated[float | None, Query(ge=-180.0, le=180.0)] = None,
+        latitude: Annotated[float | None, Query(ge=-90.0, le=90.0)] = None,
+        start_day: Annotated[str | None, Query(description="YYYY-MM-DD")] = None,
+        end_day: Annotated[str | None, Query(description="YYYY-MM-DD")] = None,
+        threshold_mm: Annotated[float | None, Query(ge=0.0)] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict:
+        supplied = [longitude, latitude, start_day, end_day, threshold_mm]
+        params_key: str | None = None
+        if any(value is not None for value in supplied):
+            if not all(value is not None for value in supplied):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "incomplete_parameters",
+                        "message": (
+                            "filtering reports requires all of longitude, latitude, "
+                            "start_day, end_day and threshold_mm"
+                        ),
+                    },
+                )
+            assert longitude is not None and latitude is not None
+            assert start_day is not None and end_day is not None
+            assert threshold_mm is not None
+            start_value = parse_day(start_day)
+            end_value = parse_day(end_day)
+            params_key = store.analysis_params_key(
+                longitude=longitude,
+                latitude=latitude,
+                start_day=start_value,
+                end_day=end_value,
+                threshold_mm=threshold_mm,
+            )
+        items, total = store.list_reports(
+            get_settings(request), params_key=params_key, limit=limit, offset=offset
+        )
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.get(
+        "/api/v1/analyses/current",
+        tags=["analyses"],
+        summary="Show the current conclusion for a parameter set",
+        responses={404: {"description": "No report for these parameters"}},
+    )
+    def current_analysis(
+        request: Request,
+        longitude: Annotated[float, Query(ge=-180.0, le=180.0)],
+        latitude: Annotated[float, Query(ge=-90.0, le=90.0)],
+        start_day: Annotated[str, Query(description="YYYY-MM-DD")],
+        end_day: Annotated[str, Query(description="YYYY-MM-DD")],
+        threshold_mm: Annotated[float, Query(ge=0.0)],
+    ) -> dict:
+        start_value = parse_day(start_day)
+        end_value = parse_day(end_day)
+        if start_value > end_value:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_day_range",
+                    "message": "start_day must not be later than end_day",
+                },
+            )
+        payload = store.get_current_report(
+            get_settings(request),
+            longitude=longitude,
+            latitude=latitude,
+            start_day=start_value,
+            end_day=end_value,
+            threshold_mm=threshold_mm,
+        )
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "report_not_found",
+                    "message": "no interpretation report exists for these parameters",
+                },
+            )
+        return {"report": payload}
+
+    @app.get(
+        "/api/v1/analyses/{report_id}",
+        tags=["analyses"],
+        summary="Show one stored report by id",
+        responses={404: {"description": "Unknown report"}},
+    )
+    def get_analysis(
+        request: Request,
+        report_id: Annotated[int, PathParam(ge=1, description="Report id")],
+    ) -> dict:
+        payload = store.get_report(get_settings(request), report_id)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "report_not_found",
+                    "message": f"report {report_id} does not exist",
+                },
+            )
+        return {"report": payload}
 
     @app.get(
         "/api/v1/mosaics",
